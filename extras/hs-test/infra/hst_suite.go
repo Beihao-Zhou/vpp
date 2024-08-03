@@ -35,6 +35,7 @@ var NConfiguredCpus = flag.Int("cpus", 1, "number of CPUs assigned to vpp")
 var VppSourceFileDir = flag.String("vppsrc", "", "vpp source file directory")
 var IsDebugBuild = flag.Bool("debug_build", false, "some paths are different with debug build")
 var UseCpu0 = flag.Bool("cpu0", false, "use cpu0")
+var IsLeakCheck = flag.Bool("leak_check", false, "run leak-check tests")
 var NumaAwareCpuAlloc bool
 var SuiteTimeout time.Duration
 
@@ -223,6 +224,10 @@ func (s *HstSuite) AssertNotEmpty(object interface{}, msgAndArgs ...interface{})
 	Expect(object).ToNot(BeEmpty(), msgAndArgs...)
 }
 
+func (s *HstSuite) AssertMatchError(actual, expected error, msgAndArgs ...interface{}) {
+	Expect(actual).To(MatchError(expected))
+}
+
 func (s *HstSuite) CreateLogger() {
 	suiteName := s.GetCurrentSuiteName()
 	var err error
@@ -285,6 +290,11 @@ func (s *HstSuite) SkipUnlessExtendedTestsBuilt() {
 	}
 }
 
+func (s *HstSuite) SkipUnlessLeakCheck() {
+	if !*IsLeakCheck {
+		s.Skip("leak-check tests excluded")
+	}
+}
 func (s *HstSuite) ResetContainers() {
 	for _, container := range s.StartedContainers {
 		container.stop()
@@ -555,6 +565,7 @@ runBenchmark creates Gomega's experiment with the passed-in name and samples the
 passing in suite context, experiment and your data.
 
 You can also instruct runBenchmark to run with multiple concurrent workers.
+Note that if running in parallel Gomega returns from Sample when spins up all samples and does not wait until all finished.
 You can record multiple named measurements (float64 or duration) within passed-in callback.
 runBenchmark then produces report to show statistical distribution of measurements.
 */

@@ -3,9 +3,14 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"github.com/onsi/gomega/ghttp"
 	"github.com/onsi/gomega/gmeasure"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
+	"os"
+	"sync"
 	"time"
 
 	. "fd.io/hs-test/infra"
@@ -14,15 +19,17 @@ import (
 
 func init() {
 	RegisterVethTests(HttpCliTest, HttpCliConnectErrorTest)
-	RegisterNoTopoTests(HeaderServerTest,
+	RegisterSoloVethTests(HttpClientGetMemLeakTest)
+	RegisterNoTopoTests(HeaderServerTest, HttpPersistentConnectionTest, HttpPipeliningTest,
 		HttpStaticMovedTest, HttpStaticNotFoundTest, HttpCliMethodNotAllowedTest,
 		HttpCliBadRequestTest, HttpStaticBuildInUrlGetIfStatsTest, HttpStaticBuildInUrlPostIfStatsTest,
 		HttpInvalidRequestLineTest, HttpMethodNotImplementedTest, HttpInvalidHeadersTest,
 		HttpContentLengthTest, HttpStaticBuildInUrlGetIfListTest, HttpStaticBuildInUrlGetVersionTest,
 		HttpStaticMacTimeTest, HttpStaticBuildInUrlGetVersionVerboseTest, HttpVersionNotSupportedTest,
 		HttpInvalidContentLengthTest, HttpInvalidTargetSyntaxTest, HttpStaticPathTraversalTest, HttpUriDecodeTest,
-		HttpHeadersTest)
-	RegisterNoTopoSoloTests(HttpStaticPromTest, HttpTpsTest, HttpTpsInterruptModeTest)
+		HttpHeadersTest, HttpStaticFileHandler, HttpClientTest, HttpClientErrRespTest)
+	RegisterNoTopoSoloTests(HttpStaticPromTest, HttpTpsTest, HttpTpsInterruptModeTest, PromConcurrentConnections,
+		PromMemLeakTest)
 }
 
 const wwwRootPath = "/tmp/www_root"
@@ -57,6 +64,98 @@ func HttpTpsTest(s *NoTopoSuite) {
 	s.RunBenchmark("HTTP tps 10M", 10, 0, httpDownloadBenchmark, url)
 }
 
+func HttpPersistentConnectionTest(s *NoTopoSuite) {
+	// testing url handler app do not support multi-thread
+	s.SkipIfMultiWorker()
+	vpp := s.GetContainerByName("vpp").VppInstance
+	serverAddress := s.GetInterfaceByName(TapInterfaceName).Peer.Ip4AddressString()
+	s.Log(vpp.Vppctl("http static server uri tcp://" + serverAddress + "/80 url-handlers"))
+	s.Log(vpp.Vppctl("test-url-handler enable"))
+
+	transport := http.DefaultTransport
+	transport.(*http.Transport).Proxy = nil
+	transport.(*http.Transport).DisableKeepAlives = false
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   time.Second * 30,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
+
+	req, err := http.NewRequest("GET", "http://"+serverAddress+":80/test1", nil)
+	s.AssertNil(err, fmt.Sprint(err))
+	resp, err := client.Do(req)
+	s.AssertNil(err, fmt.Sprint(err))
+	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
+	s.AssertEqual(200, resp.StatusCode)
+	s.AssertEqual(false, resp.Close)
+	body, err := io.ReadAll(resp.Body)
+	s.AssertNil(err, fmt.Sprint(err))
+	s.AssertEqual(string(body), "hello")
+	o1 := vpp.Vppctl("show session verbose proto http state ready")
+	s.Log(o1)
+	s.AssertContains(o1, "ESTABLISHED")
+
+	req, err = http.NewRequest("GET", "http://"+serverAddress+":80/test2", nil)
+	s.AssertNil(err, fmt.Sprint(err))
+	clientTrace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			s.AssertEqual(true, info.Reused, "connection not reused")
+		},
+	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), clientTrace))
+	resp, err = client.Do(req)
+	s.AssertNil(err, fmt.Sprint(err))
+	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
+	s.AssertEqual(200, resp.StatusCode)
+	s.AssertEqual(false, resp.Close)
+	body, err = io.ReadAll(resp.Body)
+	s.AssertNil(err, fmt.Sprint(err))
+	s.AssertEqual(string(body), "some data")
+	s.AssertNil(err, fmt.Sprint(err))
+	o2 := vpp.Vppctl("show session verbose proto http state ready")
+	s.Log(o2)
+	s.AssertContains(o2, "ESTABLISHED")
+	s.AssertEqual(o1, o2)
+}
+
+func HttpPipeliningTest(s *NoTopoSuite) {
+	// testing url handler app do not support multi-thread
+	s.SkipIfMultiWorker()
+	vpp := s.GetContainerByName("vpp").VppInstance
+	serverAddress := s.GetInterfaceByName(TapInterfaceName).Peer.Ip4AddressString()
+	s.Log(vpp.Vppctl("http static server uri tcp://" + serverAddress + "/80 url-handlers debug"))
+	s.Log(vpp.Vppctl("test-url-handler enable"))
+
+	req1 := "GET /test_delayed HTTP/1.1\r\nHost:" + serverAddress + ":80\r\nUser-Agent:test\r\n\r\n"
+	req2 := "GET /test1 HTTP/1.1\r\nHost:" + serverAddress + ":80\r\nUser-Agent:test\r\n\r\n"
+
+	conn, err := net.DialTimeout("tcp", serverAddress+":80", time.Second*30)
+	s.AssertNil(err, fmt.Sprint(err))
+	defer conn.Close()
+	err = conn.SetDeadline(time.Now().Add(time.Second * 15))
+	s.AssertNil(err, fmt.Sprint(err))
+	n, err := conn.Write([]byte(req1))
+	s.AssertNil(err, fmt.Sprint(err))
+	s.AssertEqual(n, len([]rune(req1)))
+	// send second request a bit later so first is already in progress
+	time.Sleep(500 * time.Millisecond)
+	n, err = conn.Write([]byte(req2))
+	s.AssertNil(err, fmt.Sprint(err))
+	s.AssertEqual(n, len([]rune(req2)))
+	reply := make([]byte, 1024)
+	n, err = conn.Read(reply)
+	s.AssertNil(err, fmt.Sprint(err))
+	s.Log(string(reply))
+	s.AssertContains(string(reply), "delayed data", "first request response not received")
+	s.AssertNotContains(string(reply), "hello", "second request response received")
+	// make sure response for second request is not received later
+	_, err = conn.Read(reply)
+	s.AssertMatchError(err, os.ErrDeadlineExceeded, "second request response received")
+}
+
 func HttpCliTest(s *VethsSuite) {
 	serverContainer := s.GetContainerByName("server-vpp")
 	clientContainer := s.GetContainerByName("client-vpp")
@@ -72,6 +171,7 @@ func HttpCliTest(s *VethsSuite) {
 
 	s.Log(o)
 	s.AssertContains(o, "<html>", "<html> not found in the result!")
+	s.AssertContains(o, "</html>", "</html> not found in the result!")
 }
 
 func HttpCliConnectErrorTest(s *VethsSuite) {
@@ -88,20 +188,228 @@ func HttpCliConnectErrorTest(s *VethsSuite) {
 	s.AssertContains(o, "failed to connect")
 }
 
+func HttpClientTest(s *NoTopoSuite) {
+	serverAddress := s.GetInterfaceByName(TapInterfaceName).Ip4AddressString()
+	server := ghttp.NewUnstartedServer()
+	l, err := net.Listen("tcp", serverAddress+":80")
+	s.AssertNil(err, fmt.Sprint(err))
+	server.HTTPTestServer.Listener = l
+	server.AppendHandlers(
+		ghttp.CombineHandlers(
+			ghttp.VerifyRequest("GET", "/test"),
+			ghttp.VerifyHeader(http.Header{"User-Agent": []string{"http_cli_client"}}),
+			ghttp.VerifyHeader(http.Header{"Accept": []string{"text / html"}}),
+			ghttp.RespondWith(http.StatusOK, "<html><body><p>Hello</p></body></html>"),
+		))
+	server.Start()
+	defer server.Close()
+	uri := "http://" + serverAddress + "/80"
+	vpp := s.GetContainerByName("vpp").VppInstance
+	o := vpp.Vppctl("http cli client uri " + uri + " query /test")
+
+	s.Log(o)
+	s.AssertContains(o, "<html>", "<html> not found in the result!")
+	s.AssertContains(o, "</html>", "</html> not found in the result!")
+}
+
+func HttpClientErrRespTest(s *NoTopoSuite) {
+	serverAddress := s.GetInterfaceByName(TapInterfaceName).Ip4AddressString()
+	server := ghttp.NewUnstartedServer()
+	l, err := net.Listen("tcp", serverAddress+":80")
+	s.AssertNil(err, fmt.Sprint(err))
+	server.HTTPTestServer.Listener = l
+	server.AppendHandlers(
+		ghttp.CombineHandlers(
+			ghttp.VerifyRequest("GET", "/test"),
+			ghttp.RespondWith(http.StatusNotFound, "404: Not Found"),
+		))
+	server.Start()
+	defer server.Close()
+	uri := "http://" + serverAddress + "/80"
+	vpp := s.GetContainerByName("vpp").VppInstance
+	o := vpp.Vppctl("http cli client uri " + uri + " query /test")
+
+	s.Log(o)
+	s.AssertContains(o, "404: Not Found", "error not found in the result!")
+}
+
 func HttpStaticPromTest(s *NoTopoSuite) {
-	finished := make(chan error, 1)
 	query := "stats.prom"
 	vpp := s.GetContainerByName("vpp").VppInstance
 	serverAddress := s.GetInterfaceByName(TapInterfaceName).Peer.Ip4AddressString()
 	s.Log(vpp.Vppctl("http static server uri tcp://" + serverAddress + "/80 url-handlers"))
 	s.Log(vpp.Vppctl("prom enable"))
 	time.Sleep(time.Second * 5)
-	go func() {
-		defer GinkgoRecover()
-		s.StartWget(finished, serverAddress, "80", query, "")
-	}()
-	err := <-finished
-	s.AssertNil(err)
+	client := NewHttpClient()
+	req, err := http.NewRequest("GET", "http://"+serverAddress+":80/"+query, nil)
+	s.AssertNil(err, fmt.Sprint(err))
+	resp, err := client.Do(req)
+	s.AssertNil(err, fmt.Sprint(err))
+	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, false))
+	s.AssertEqual(200, resp.StatusCode)
+	s.AssertContains(resp.Header.Get("Content-Type"), "text")
+	s.AssertContains(resp.Header.Get("Content-Type"), "plain")
+	s.AssertNotEqual(int64(0), resp.ContentLength)
+	_, err = io.ReadAll(resp.Body)
+}
+
+func promReq(s *NoTopoSuite, url string) {
+	client := NewHttpClient()
+	req, err := http.NewRequest("GET", url, nil)
+	s.AssertNil(err, fmt.Sprint(err))
+	resp, err := client.Do(req)
+	s.AssertNil(err, fmt.Sprint(err))
+	defer resp.Body.Close()
+	s.AssertEqual(200, resp.StatusCode)
+	_, err = io.ReadAll(resp.Body)
+}
+
+func promReqWg(s *NoTopoSuite, url string, wg *sync.WaitGroup) {
+	defer GinkgoRecover()
+	defer wg.Done()
+	promReq(s, url)
+}
+
+func PromConcurrentConnections(s *NoTopoSuite) {
+	vpp := s.GetContainerByName("vpp").VppInstance
+	serverAddress := s.GetInterfaceByName(TapInterfaceName).Peer.Ip4AddressString()
+	url := "http://" + serverAddress + ":80/stats.prom"
+
+	s.Log(vpp.Vppctl("http static server uri tcp://" + serverAddress + "/80 url-handlers"))
+	s.Log(vpp.Vppctl("prom enable"))
+	time.Sleep(time.Second * 5)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go promReqWg(s, url, &wg)
+	}
+	wg.Wait()
+	s.Log(vpp.Vppctl("show session verbose proto http"))
+}
+
+func PromMemLeakTest(s *NoTopoSuite) {
+	s.SkipUnlessLeakCheck()
+
+	vpp := s.GetContainerByName("vpp").VppInstance
+	serverAddress := s.GetInterfaceByName(TapInterfaceName).Peer.Ip4AddressString()
+	url := "http://" + serverAddress + ":80/stats.prom"
+
+	/* no goVPP less noise */
+	vpp.Disconnect()
+
+	s.Log(vpp.Vppctl("http static server uri tcp://" + serverAddress + "/80 url-handlers"))
+	s.Log(vpp.Vppctl("prom enable"))
+	time.Sleep(time.Second * 3)
+
+	/* warmup request (FIB) */
+	promReq(s, url)
+
+	vpp.EnableMemoryTrace()
+	traces1, err := vpp.GetMemoryTrace()
+	s.AssertNil(err, fmt.Sprint(err))
+
+	/* collect stats couple of times */
+	for i := 0; i < 5; i++ {
+		time.Sleep(time.Second * 1)
+		promReq(s, url)
+	}
+
+	/* let's give it some time to clean up sessions */
+	time.Sleep(time.Second * 5)
+
+	traces2, err := vpp.GetMemoryTrace()
+	s.AssertNil(err, fmt.Sprint(err))
+	vpp.MemLeakCheck(traces1, traces2)
+}
+
+func HttpClientGetMemLeakTest(s *VethsSuite) {
+	s.SkipUnlessLeakCheck()
+
+	serverContainer := s.GetContainerByName("server-vpp").VppInstance
+	clientContainer := s.GetContainerByName("client-vpp").VppInstance
+	serverVeth := s.GetInterfaceByName(ServerInterfaceName)
+
+	/* no goVPP less noise */
+	clientContainer.Disconnect()
+
+	serverContainer.Vppctl("http cli server")
+
+	uri := "http://" + serverVeth.Ip4AddressString() + "/80"
+
+	/* warmup request (FIB) */
+	clientContainer.Vppctl("http cli client uri " + uri + " query /show/version")
+
+	clientContainer.EnableMemoryTrace()
+	traces1, err := clientContainer.GetMemoryTrace()
+	s.AssertNil(err, fmt.Sprint(err))
+
+	clientContainer.Vppctl("http cli client uri " + uri + " query /show/vlib/graph")
+
+	/* let's give it some time to clean up sessions */
+	time.Sleep(time.Second * 12)
+
+	traces2, err := clientContainer.GetMemoryTrace()
+	s.AssertNil(err, fmt.Sprint(err))
+	clientContainer.MemLeakCheck(traces1, traces2)
+}
+
+func HttpStaticFileHandler(s *NoTopoSuite) {
+	content := "<html><body><p>Hello</p></body></html>"
+	content2 := "<html><body><p>Page</p></body></html>"
+	vpp := s.GetContainerByName("vpp").VppInstance
+	vpp.Container.Exec("mkdir -p " + wwwRootPath)
+	vpp.Container.CreateFile(wwwRootPath+"/index.html", content)
+	vpp.Container.CreateFile(wwwRootPath+"/page.html", content2)
+	serverAddress := s.GetInterfaceByName(TapInterfaceName).Peer.Ip4AddressString()
+	s.Log(vpp.Vppctl("http static server www-root " + wwwRootPath + " uri tcp://" + serverAddress + "/80 debug cache-size 2m"))
+
+	client := NewHttpClient()
+	req, err := http.NewRequest("GET", "http://"+serverAddress+":80/index.html", nil)
+	s.AssertNil(err, fmt.Sprint(err))
+	resp, err := client.Do(req)
+	s.AssertNil(err, fmt.Sprint(err))
+	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
+	s.AssertEqual(200, resp.StatusCode)
+	s.AssertContains(resp.Header.Get("Content-Type"), "html")
+	s.AssertContains(resp.Header.Get("Cache-Control"), "max-age=")
+	s.AssertEqual(int64(len([]rune(content))), resp.ContentLength)
+	body, err := io.ReadAll(resp.Body)
+	s.AssertEqual(string(body), content)
+	o := vpp.Vppctl("show http static server cache verbose")
+	s.Log(o)
+	s.AssertContains(o, "index.html")
+	s.AssertNotContains(o, "page.html")
+
+	resp, err = client.Do(req)
+	s.AssertNil(err, fmt.Sprint(err))
+	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
+	s.AssertEqual(200, resp.StatusCode)
+	s.AssertContains(resp.Header.Get("Content-Type"), "html")
+	s.AssertContains(resp.Header.Get("Cache-Control"), "max-age=")
+	s.AssertEqual(int64(len([]rune(content))), resp.ContentLength)
+	body, err = io.ReadAll(resp.Body)
+	s.AssertEqual(string(body), content)
+
+	req, err = http.NewRequest("GET", "http://"+serverAddress+":80/page.html", nil)
+	s.AssertNil(err, fmt.Sprint(err))
+	resp, err = client.Do(req)
+	s.AssertNil(err, fmt.Sprint(err))
+	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
+	s.AssertEqual(200, resp.StatusCode)
+	s.AssertContains(resp.Header.Get("Content-Type"), "html")
+	s.AssertContains(resp.Header.Get("Cache-Control"), "max-age=")
+	s.AssertEqual(int64(len([]rune(content2))), resp.ContentLength)
+	body, err = io.ReadAll(resp.Body)
+	s.AssertEqual(string(body), content2)
+	o = vpp.Vppctl("show http static server cache verbose")
+	s.Log(o)
+	s.AssertContains(o, "index.html")
+	s.AssertContains(o, "page.html")
 }
 
 func HttpStaticPathTraversalTest(s *NoTopoSuite) {
@@ -118,13 +426,17 @@ func HttpStaticPathTraversalTest(s *NoTopoSuite) {
 	resp, err := client.Do(req)
 	s.AssertNil(err, fmt.Sprint(err))
 	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
 	s.AssertEqual(404, resp.StatusCode)
+	s.AssertEmpty(resp.Header.Get("Content-Type"))
+	s.AssertEmpty(resp.Header.Get("Cache-Control"))
+	s.AssertEqual(int64(0), resp.ContentLength)
 }
 
 func HttpStaticMovedTest(s *NoTopoSuite) {
 	vpp := s.GetContainerByName("vpp").VppInstance
 	vpp.Container.Exec("mkdir -p " + wwwRootPath + "/tmp.aaa")
-	vpp.Container.CreateFile(wwwRootPath+"/tmp.aaa/index.html", "<http><body><p>Hello</p></body></http>")
+	vpp.Container.CreateFile(wwwRootPath+"/tmp.aaa/index.html", "<html><body><p>Hello</p></body></html>")
 	serverAddress := s.GetInterfaceByName(TapInterfaceName).Peer.Ip4AddressString()
 	s.Log(vpp.Vppctl("http static server www-root " + wwwRootPath + " uri tcp://" + serverAddress + "/80 debug"))
 
@@ -134,8 +446,12 @@ func HttpStaticMovedTest(s *NoTopoSuite) {
 	resp, err := client.Do(req)
 	s.AssertNil(err, fmt.Sprint(err))
 	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
 	s.AssertEqual(301, resp.StatusCode)
-	s.AssertNotEqual("", resp.Header.Get("Location"))
+	s.AssertEqual("http://"+serverAddress+"/tmp.aaa/index.html", resp.Header.Get("Location"))
+	s.AssertEmpty(resp.Header.Get("Content-Type"))
+	s.AssertEmpty(resp.Header.Get("Cache-Control"))
+	s.AssertEqual(int64(0), resp.ContentLength)
 }
 
 func HttpStaticNotFoundTest(s *NoTopoSuite) {
@@ -150,7 +466,11 @@ func HttpStaticNotFoundTest(s *NoTopoSuite) {
 	resp, err := client.Do(req)
 	s.AssertNil(err, fmt.Sprint(err))
 	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
 	s.AssertEqual(404, resp.StatusCode)
+	s.AssertEmpty(resp.Header.Get("Content-Type"))
+	s.AssertEmpty(resp.Header.Get("Cache-Control"))
+	s.AssertEqual(int64(0), resp.ContentLength)
 }
 
 func HttpCliMethodNotAllowedTest(s *NoTopoSuite) {
@@ -164,9 +484,11 @@ func HttpCliMethodNotAllowedTest(s *NoTopoSuite) {
 	resp, err := client.Do(req)
 	s.AssertNil(err, fmt.Sprint(err))
 	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
 	s.AssertEqual(405, resp.StatusCode)
-	// TODO: need to be fixed in http code
-	//s.AssertNotEqual("", resp.Header.Get("Allow"))
+	s.AssertNotEqual("", resp.Header.Get("Allow"), "server MUST generate an Allow header")
+	s.AssertEmpty(resp.Header.Get("Content-Type"))
+	s.AssertEqual(int64(0), resp.ContentLength)
 }
 
 func HttpCliBadRequestTest(s *NoTopoSuite) {
@@ -180,7 +502,10 @@ func HttpCliBadRequestTest(s *NoTopoSuite) {
 	resp, err := client.Do(req)
 	s.AssertNil(err, fmt.Sprint(err))
 	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
 	s.AssertEqual(400, resp.StatusCode)
+	s.AssertEmpty(resp.Header.Get("Content-Type"))
+	s.AssertEqual(int64(0), resp.ContentLength)
 }
 
 func HttpStaticBuildInUrlGetVersionTest(s *NoTopoSuite) {
@@ -194,6 +519,7 @@ func HttpStaticBuildInUrlGetVersionTest(s *NoTopoSuite) {
 	resp, err := client.Do(req)
 	s.AssertNil(err, fmt.Sprint(err))
 	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
 	s.AssertEqual(200, resp.StatusCode)
 	data, err := io.ReadAll(resp.Body)
 	s.AssertNil(err, fmt.Sprint(err))
@@ -203,6 +529,7 @@ func HttpStaticBuildInUrlGetVersionTest(s *NoTopoSuite) {
 	s.AssertNotContains(string(data), "build_by")
 	s.AssertNotContains(string(data), "build_host")
 	s.AssertNotContains(string(data), "build_dir")
+	s.AssertContains(resp.Header.Get("Content-Type"), "json")
 }
 
 func HttpStaticBuildInUrlGetVersionVerboseTest(s *NoTopoSuite) {
@@ -216,6 +543,7 @@ func HttpStaticBuildInUrlGetVersionVerboseTest(s *NoTopoSuite) {
 	resp, err := client.Do(req)
 	s.AssertNil(err, fmt.Sprint(err))
 	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
 	s.AssertEqual(200, resp.StatusCode)
 	data, err := io.ReadAll(resp.Body)
 	s.AssertNil(err, fmt.Sprint(err))
@@ -225,6 +553,7 @@ func HttpStaticBuildInUrlGetVersionVerboseTest(s *NoTopoSuite) {
 	s.AssertContains(string(data), "build_by")
 	s.AssertContains(string(data), "build_host")
 	s.AssertContains(string(data), "build_dir")
+	s.AssertContains(resp.Header.Get("Content-Type"), "json")
 }
 
 func HttpStaticBuildInUrlGetIfListTest(s *NoTopoSuite) {
@@ -238,11 +567,13 @@ func HttpStaticBuildInUrlGetIfListTest(s *NoTopoSuite) {
 	resp, err := client.Do(req)
 	s.AssertNil(err, fmt.Sprint(err))
 	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
 	s.AssertEqual(200, resp.StatusCode)
 	data, err := io.ReadAll(resp.Body)
 	s.AssertNil(err, fmt.Sprint(err))
 	s.AssertContains(string(data), "interface_list")
 	s.AssertContains(string(data), s.GetInterfaceByName(TapInterfaceName).Peer.Name())
+	s.AssertContains(resp.Header.Get("Content-Type"), "json")
 }
 
 func HttpStaticBuildInUrlGetIfStatsTest(s *NoTopoSuite) {
@@ -256,12 +587,14 @@ func HttpStaticBuildInUrlGetIfStatsTest(s *NoTopoSuite) {
 	resp, err := client.Do(req)
 	s.AssertNil(err, fmt.Sprint(err))
 	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
 	s.AssertEqual(200, resp.StatusCode)
 	data, err := io.ReadAll(resp.Body)
 	s.AssertNil(err, fmt.Sprint(err))
 	s.AssertContains(string(data), "interface_stats")
 	s.AssertContains(string(data), "local0")
 	s.AssertContains(string(data), s.GetInterfaceByName(TapInterfaceName).Peer.Name())
+	s.AssertContains(resp.Header.Get("Content-Type"), "json")
 }
 
 func validatePostInterfaceStats(s *NoTopoSuite, data string) {
@@ -284,10 +617,12 @@ func HttpStaticBuildInUrlPostIfStatsTest(s *NoTopoSuite) {
 	resp, err := client.Do(req)
 	s.AssertNil(err, fmt.Sprint(err))
 	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
 	s.AssertEqual(200, resp.StatusCode)
 	data, err := io.ReadAll(resp.Body)
 	s.AssertNil(err, fmt.Sprint(err))
 	validatePostInterfaceStats(s, string(data))
+	s.AssertContains(resp.Header.Get("Content-Type"), "json")
 }
 
 func HttpStaticMacTimeTest(s *NoTopoSuite) {
@@ -302,12 +637,14 @@ func HttpStaticMacTimeTest(s *NoTopoSuite) {
 	resp, err := client.Do(req)
 	s.AssertNil(err, fmt.Sprint(err))
 	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
 	s.AssertEqual(200, resp.StatusCode)
 	data, err := io.ReadAll(resp.Body)
 	s.AssertNil(err, fmt.Sprint(err))
 	s.AssertContains(string(data), "mactime")
 	s.AssertContains(string(data), s.GetInterfaceByName(TapInterfaceName).Ip4AddressString())
 	s.AssertContains(string(data), s.GetInterfaceByName(TapInterfaceName).HwAddress.String())
+	s.AssertContains(resp.Header.Get("Content-Type"), "json")
 }
 
 func HttpInvalidRequestLineTest(s *NoTopoSuite) {
@@ -444,7 +781,10 @@ func HttpMethodNotImplementedTest(s *NoTopoSuite) {
 	resp, err := client.Do(req)
 	s.AssertNil(err, fmt.Sprint(err))
 	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
 	s.AssertEqual(501, resp.StatusCode)
+	s.AssertEmpty(resp.Header.Get("Content-Type"))
+	s.AssertEqual(int64(0), resp.ContentLength)
 }
 
 func HttpVersionNotSupportedTest(s *NoTopoSuite) {
@@ -468,12 +808,13 @@ func HttpUriDecodeTest(s *NoTopoSuite) {
 	resp, err := client.Do(req)
 	s.AssertNil(err, fmt.Sprint(err))
 	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
 	s.AssertEqual(200, resp.StatusCode)
 	data, err := io.ReadAll(resp.Body)
 	s.AssertNil(err, fmt.Sprint(err))
-	s.Log(string(data))
 	s.AssertNotContains(string(data), "unknown input")
 	s.AssertContains(string(data), "Compiler")
+	s.AssertContains(resp.Header.Get("Content-Type"), "html")
 }
 
 func HttpHeadersTest(s *NoTopoSuite) {
@@ -539,5 +880,8 @@ func HeaderServerTest(s *NoTopoSuite) {
 	resp, err := client.Do(req)
 	s.AssertNil(err, fmt.Sprint(err))
 	defer resp.Body.Close()
+	s.Log(DumpHttpResp(resp, true))
+	s.AssertEqual(200, resp.StatusCode)
 	s.AssertEqual("http_cli_server", resp.Header.Get("Server"))
+	s.AssertContains(resp.Header.Get("Content-Type"), "html")
 }

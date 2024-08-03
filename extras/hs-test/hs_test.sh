@@ -7,8 +7,10 @@ single_test=0
 persist_set=0
 unconfigure_set=0
 debug_set=0
+leak_check_set=0
 debug_build=
 ginkgo_args=
+tc_name=
 
 for i in "$@"
 do
@@ -74,6 +76,13 @@ case "${i}" in
             args="$args -cpu0"
         fi
         ;;
+    --leak_check=*)
+        leak_check="${i#*=}"
+        if [ "$leak_check" = "true" ]; then
+            args="$args -leak_check"
+            leak_check_set=1
+        fi
+        ;;
 esac
 done
 
@@ -97,9 +106,23 @@ if [ $single_test -eq 0 ] && [ $debug_set -eq 1 ]; then
     exit 1
 fi
 
+if [ $leak_check_set -eq 1 ]; then
+  if [ $single_test -eq 0 ]; then
+    echo "a single test has to be specified when leak_check is set"
+    exit 1
+  fi
+  ginkgo_args="--focus $tc_name"
+  sudo -E go run github.com/onsi/ginkgo/v2/ginkgo $ginkgo_args -- $args
+  exit 0
+fi
+
+if [ -n "${BUILD_NUMBER}" ]; then
+       ginkgo_args="$ginkgo_args --no-color"
+fi
+
 mkdir -p summary
 # shellcheck disable=SC2086
-sudo -E go run github.com/onsi/ginkgo/v2/ginkgo --no-color --trace --json-report=summary/report.json $ginkgo_args -- $args
+sudo -E go run github.com/onsi/ginkgo/v2/ginkgo --trace --json-report=summary/report.json $ginkgo_args -- $args
 
 jq -r '.[0] | .SpecReports[] | select((.State == "failed") or (.State == "timedout") or (.State == "panicked")) | select(.Failure != null) | "TestName: \(.LeafNodeText)\nSuite:\n\(.Failure.FailureNodeLocation.FileName)\nMessage:\n\(.Failure.Message)\n Full Stack Trace:\n\(.Failure.Location.FullStackTrace)\n"' summary/report.json > summary/failed-summary.log \
 	&& echo "Summary generated -> summary/failed-summary.log"

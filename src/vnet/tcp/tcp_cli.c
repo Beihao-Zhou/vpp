@@ -250,6 +250,21 @@ format_tcp_connection_id (u8 * s, va_list * args)
 }
 
 u8 *
+format_tcp_listener_connection (u8 *s, va_list *args)
+{
+  tcp_connection_t *tc = va_arg (*args, tcp_connection_t *);
+
+  s = format (s, " index: %u cfg_flags: %U cong_algo: %s snd_mss: %u\n",
+	      tc->c_c_index, format_tcp_cfg_flags, tc, tc->cc_algo->name,
+	      tc->snd_mss);
+  s = format (s, " next_node %u opaque 0x%x fib_index %u sw_if_index %d",
+	      tc->next_node_index, tc->next_node_opaque, tc->c_fib_index,
+	      tc->sw_if_index);
+
+  return s;
+}
+
+u8 *
 format_tcp_connection (u8 * s, va_list * args)
 {
   tcp_connection_t *tc = va_arg (*args, tcp_connection_t *);
@@ -823,6 +838,74 @@ VLIB_CLI_COMMAND (show_tcp_punt_command, static) =
   .path = "show tcp punt",
   .short_help = "show tcp punt",
   .function = show_tcp_punt_fn,
+};
+
+static u8 *
+format_tcp_cfg (u8 *s, va_list *args)
+{
+  tcp_configuration_t tm_cfg = va_arg (*args, tcp_configuration_t);
+
+  s = format (s, "max rx fifo size: %U\n", format_memory_size,
+	      tm_cfg.max_rx_fifo);
+  s = format (s, "min rx fifo size: %U\n", format_memory_size,
+	      tm_cfg.min_rx_fifo);
+  s = format (s, "default mtu: %u\n", tm_cfg.default_mtu);
+  s = format (s, "initial cwnd multiplier: %u\n",
+	      tm_cfg.initial_cwnd_multiplier);
+  s = format (s, "tx pacing: %s\n",
+	      tm_cfg.enable_tx_pacing ? "enabled" : "disabled");
+  s = format (s, "tso: %s\n", tm_cfg.allow_tso ? "allowed" : "disallowed");
+  s = format (s, "checksum offload: %s\n",
+	      tm_cfg.csum_offload ? "enabled" : "disabled");
+  s = format (s, "congestion control algorithm: %s\n",
+	      tcp_cc_algo_get (tm_cfg.cc_algo)->name);
+  s = format (s, "min rwnd update ack: %u\n", tm_cfg.rwnd_min_update_ack);
+  s = format (s, "max gso packet size: %U\n", format_memory_size,
+	      tm_cfg.max_gso_size);
+  s = format (s, "close_wait time: %u sec\n",
+	      (u32) (tm_cfg.closewait_time * TCP_TIMER_TICK));
+  s = format (s, "time_wait time: %u sec\n",
+	      (u32) (tm_cfg.timewait_time * TCP_TIMER_TICK));
+  s = format (s, "fin_wait1 time: %u sec\n",
+	      (u32) (tm_cfg.finwait1_time * TCP_TIMER_TICK));
+  s = format (s, "fin_wait2 time: %u sec\n",
+	      (u32) (tm_cfg.finwait2_time * TCP_TIMER_TICK));
+  s = format (s, "last_ack time: %u sec\n",
+	      (u32) (tm_cfg.lastack_time * TCP_TIMER_TICK));
+  s = format (s, "fin_ack time: %u sec\n",
+	      (u32) (tm_cfg.closing_time * TCP_TIMER_TICK));
+  s = format (s, "syn_rcvd time: %u sec\n",
+	      (u32) (tm_cfg.syn_rcvd_time * TCP_TICK));
+  s = format (s, "tcp allocation error cleanup time: %0.2f sec\n",
+	      (f32) (tm_cfg.alloc_err_timeout * TCP_TIMER_TICK));
+  s = format (s, "connection cleanup time: %.2f sec\n", tm_cfg.cleanup_time);
+  s = format (s, "tcp preallocated connections: %u",
+	      tm_cfg.preallocated_connections);
+
+  return s;
+}
+
+static clib_error_t *
+show_tcp_cfg_fn (vlib_main_t *vm, unformat_input_t *input,
+		 vlib_cli_command_t *cmd)
+{
+  tcp_main_t *tm = vnet_get_tcp_main ();
+
+  if (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
+    return clib_error_return (0, "unknown input `%U'", format_unformat_error,
+			      input);
+  vlib_cli_output (vm, "-----------");
+  vlib_cli_output (vm, "tcp config");
+  vlib_cli_output (vm, "-----------");
+  vlib_cli_output (vm, "%U\n", format_tcp_cfg, tm->cfg);
+
+  return 0;
+}
+
+VLIB_CLI_COMMAND (show_tcp_cfg_command, static) = {
+  .path = "show tcp config",
+  .short_help = "show tcp config",
+  .function = show_tcp_cfg_fn,
 };
 
 static clib_error_t *

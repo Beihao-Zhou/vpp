@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/docker/go-units"
 	"os"
 	"os/exec"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -13,9 +15,9 @@ import (
 	"time"
 
 	containerTypes "github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/pkg/stdcopy"
-	"github.com/docker/go-units"
 	"github.com/edwarnicke/exechelper"
 	. "github.com/onsi/ginkgo/v2"
 )
@@ -179,9 +181,10 @@ func (c *Container) Create() error {
 	resp, err := c.Suite.Docker.ContainerCreate(
 		c.ctx,
 		&containerTypes.Config{
-			Image: c.Image,
-			Env:   c.getEnvVars(),
-			Cmd:   strings.Split(c.ExtraRunningArgs, " "),
+			Hostname: c.Name,
+			Image:    c.Image,
+			Env:      c.getEnvVars(),
+			Cmd:      strings.Split(c.ExtraRunningArgs, " "),
 		},
 		&containerTypes.HostConfig{
 			Resources: containerTypes.Resources{
@@ -216,13 +219,34 @@ func (c *Container) allocateCpus() {
 // Starts a container
 func (c *Container) Start() error {
 	var err error
-	for nTries := 0; nTries < 5; nTries++ {
+	var nTries int
+
+	for nTries = 0; nTries < 5; nTries++ {
 		err = c.Suite.Docker.ContainerStart(c.ctx, c.ID, containerTypes.StartOptions{})
 		if err == nil {
 			continue
 		}
 		c.Suite.Log("Error while starting " + c.Name + ". Retrying...")
 		time.Sleep(1 * time.Second)
+	}
+	if nTries >= 5 {
+		return err
+	}
+
+	// wait for container to start
+	time.Sleep(1 * time.Second)
+
+	// check if container exited right after startup
+	containers, err := c.Suite.Docker.ContainerList(c.ctx, containerTypes.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("name", c.Name)),
+	})
+	if err != nil {
+		return err
+	}
+	if containers[0].State == "exited" {
+		c.Suite.Log("Container details: " + fmt.Sprint(containers[0]))
+		return fmt.Errorf("Container %s exited: '%s'", c.Name, containers[0].Status)
 	}
 
 	return err
@@ -382,6 +406,11 @@ func (c *Container) CreateFile(destFileName string, content string) error {
 	return nil
 }
 
+func (c *Container) GetFile(sourceFileName, targetFileName string) error {
+	cmd := exec.Command("docker", "cp", c.Name+":"+sourceFileName, targetFileName)
+	return cmd.Run()
+}
+
 /*
  * Executes in detached mode so that the started application can continue to run
  * without blocking execution of test
@@ -441,7 +470,7 @@ func (c *Container) saveLogs() {
 func (c *Container) log(maxLines int) (string, error) {
 	var logOptions containerTypes.LogsOptions
 	if maxLines == 0 {
-		logOptions = containerTypes.LogsOptions{ShowStdout: true, ShowStderr: true, Details: true}
+		logOptions = containerTypes.LogsOptions{ShowStdout: true, ShowStderr: true, Details: true, Timestamps: true}
 	} else {
 		logOptions = containerTypes.LogsOptions{ShowStdout: true, ShowStderr: true, Details: true, Tail: strconv.Itoa(maxLines)}
 	}
@@ -463,12 +492,11 @@ func (c *Container) log(maxLines int) (string, error) {
 	stdout := stdoutBuf.String()
 	stderr := stderrBuf.String()
 
-	if strings.Contains(stdout, "==> /dev/null <==") {
-		stdout = ""
-	}
-	if strings.Contains(stderr, "tail: cannot open") {
-		stderr = ""
-	}
+	re := regexp.MustCompile("(?m)^.*==> /dev/null <==.*$[\r\n]+")
+	stdout = re.ReplaceAllString(stdout, "")
+
+	re = regexp.MustCompile("(?m)^.*tail: cannot open '' for reading: No such file or directory.*$[\r\n]+")
+	stderr = re.ReplaceAllString(stderr, "")
 
 	return stdout + stderr, err
 }

@@ -6,7 +6,6 @@ RUN apt-get update \
  && apt-get install -y openssl libapr1 libnuma1 libsubunit0 \
     iproute2 libnl-3-dev libnl-route-3-dev python3 iputils-ping  \
     vim gdb libunwind-dev \
-    build-essential scons libevent-dev gengetopt memcached \
  && rm -rf /var/lib/apt/lists/*
 
 ENV DIR=vpp-data/lib/vpp_plugins
@@ -29,7 +28,6 @@ COPY vpp-data/bin/vppctl /usr/bin/
 COPY vpp-data/bin/vpp_echo /usr/bin/
 COPY vpp-data/bin/vcl_* /usr/bin/
 COPY vpp-data/lib/*.so /usr/lib/
-COPY third-party/mutilate/mutilate /usr/bin/
 
 RUN addgroup vpp
 

@@ -1,0 +1,3 @@
+[submodule "extras/hs-test/resources/mutilate"]
+	path = extras/hs-test/resources/mutilate
+	url = https://github.com/leverich/mutilate.git

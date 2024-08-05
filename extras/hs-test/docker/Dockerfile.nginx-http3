@@ -14,6 +14,7 @@ COPY resources/nginx/nginx_http3.conf /nginx.conf
 COPY script/nginx_ldp.sh /usr/bin/nginx_ldp.sh
 
 COPY resources/nginx/html/index.html /usr/share/nginx/index.html
+COPY third-party/mutilate/mutilate /usr/bin/
 
 ENV VCL_CONFIG=/vcl.conf
 ENV LDP=/usr/lib/libvcl_ldpreload.so

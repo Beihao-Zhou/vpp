@@ -108,7 +108,7 @@ func StartMemcachedServerApp(s *VethsSuite, srvCh chan error, stopServerCh chan 
     // Log the path of memcached
     s.Log(fmt.Sprintf("memcached found at: %s", memcachedPath))
     go func() {
-        cmd := exec.Command(memcachedPath, "-m", "64", "-p", "11211", "-u", "nobody")
+        cmd := exec.Command(memcachedPath, "-m", "64", "-p", "11211", "-u", "nobody", "-d")
         cmd.Env = srvEnv
         s.Log(cmd)
         err := cmd.Start()
@@ -125,15 +125,8 @@ func StartMemcachedServerApp(s *VethsSuite, srvCh chan error, stopServerCh chan 
 func StartMutilateClientApp(s *VethsSuite, serverVethAddress string, clnEnv []string, clnCh chan error, clnRes chan string) {
     s.Log("starting Mutilate client")
 
-    // TODO: Fix timeout error
-    mutilatePath, err := exec.LookPath("mutilate")
-    if err != nil {
-        clnCh <- fmt.Errorf("mutilate not found: %v", err)
-        return
-    }
-
-    s.Log(fmt.Sprintf("mutilate found at: %s", mutilatePath))
-    cmd := exec.Command(mutilatePath, "-s", serverVethAddress+":11211")
+    // TODO: Fix file not found
+    cmd := exec.Command("/usr/bin/mutilate", "-s", serverVethAddress+":11211")
     cmd.Env = clnEnv
     output, err := cmd.CombinedOutput()
     clnRes <- string(output)

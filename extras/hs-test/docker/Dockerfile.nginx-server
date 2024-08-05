@@ -8,5 +8,6 @@ RUN apt-get update \
 
 COPY resources/nginx/nginx_server_mirroring.conf /nginx.conf
 COPY script/nginx_mirroring_entrypoint.sh /usr/bin/nginx_mirroring_entrypoint.sh
+COPY third-party/mutilate/mutilate /usr/bin/
 
-ENTRYPOINT ["nginx_mirroring_entrypoint.sh"]
+ENTRYPOINT ["nginx", "-c", "/nginx.conf"]

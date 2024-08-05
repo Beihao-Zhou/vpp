@@ -1,6 +1,8 @@
 FROM hs-test/build
 
 COPY script/build_curl.sh /build_curl.sh
+COPY third-party/mutilate/mutilate /usr/bin/
+
 RUN apt-get update && apt-get install wget
 RUN /build_curl.sh
 
